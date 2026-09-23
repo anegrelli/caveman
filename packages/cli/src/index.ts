@@ -212,7 +212,7 @@ const CLOUD_DISCOVERY: DiscoveryGroup[] = [
   { heading: "governance", verbs: [
     { verb: "audit", description: "import or report audit evidence" },
     { verb: "sync", description: "sync local metadata to connected org" },
-    { verb: "agent", description: "inspect proposal-only optimization PRs" },
+    { verb: "agent", description: "inspect agents and optimization proposals" },
   ] },
 ];
 
@@ -316,11 +316,18 @@ const CLOUD_HANDLERS: Record<string, CommandHandler> = {
   },
   audit,
   sync: () => sync(),
-  agent: (argv) => {
+  agent: async (argv) => {
+    if (argv[0] === "factory") {
+      if (argv[1] === "list" && argv.length === 2) return get(`/api/v1/projects/${await projectId()}/agents`).then(print);
+      if (argv[1] === "show" && argv.length === 3 && /^[A-Za-z0-9_-]+$/.test(argv[2]!)) {
+        return get(`/api/v1/projects/${await projectId()}/agents/${argv[2]}`).then(print);
+      }
+      return commandUsage("agent factory list|show <id>");
+    }
     if (argv[0] === "list") return get("/api/v1/optimization-proposals").then(print);
     if (argv[0] === "show") return get(`/api/v1/optimization-proposals/${argv[1] ?? ""}`).then(print);
     if (argv[0] === "run") return post(`/api/v1/optimization-proposals/${argv[1] ?? ""}/run`, {}).then(print);
-    return commandUsage("agent list|show <id>|run <id>");
+    return commandUsage("agent list|show <id>|run <id> | agent factory list|show <id>");
   },
 };
 
@@ -5126,7 +5133,7 @@ async function agentShortcut(rest: string[]) {
 // is the one-command compression path. If the proxy can't be reached, a TTY run
 // offers to launch the agent directly (no Caveman, no compression this run) rather
 // than wire it to a dead endpoint; non-TTY runs warn and route through as before.
-async function runWrapped(bin: string, cmdArgs: string[], agent?: AgentProfile, opts: WrapOptions = { mode: "compress", noProxy: false, toon: true, noShrink: false, mcpMode: "auto", noBrowse: false, delegate: false, minimal: false, command: [] }, codexSubscription = false, routeDecision?: AgentRouteOverride | null) {
+async function runWrapped(bin: string, cmdArgs: string[], agent?: AgentProfile, opts: WrapOptions = { mode: "compress", noProxy: false, toon: true, noShrink: false, mcpMode: "auto", noBrowse: false, delegate: false, minimal: false, command: [] }, codexSubscription?: boolean, routeDecision?: AgentRouteOverride | null) {
   const result = await spawnWrapped(bin, cmdArgs, agent, opts, gatewayURL(), codexSubscription, routeDecision);
   // Preflight route bypass is intentionally outside Caveman's lifecycle: no
   // savings read, sync, telemetry, or other post-child mutation.
@@ -5190,9 +5197,23 @@ async function spawnWrapped(
   agent: AgentProfile | undefined,
   opts: WrapOptions,
   gw: string,
-  codexSubscription = false,
+  codexSubscriptionOverride?: boolean,
   routeDecision?: AgentRouteOverride | null,
 ): Promise<{ code: number; proxyStarted: boolean; routeBypass: boolean; sessionStart?: string | undefined; summaryKind?: "observe" | "compress" | undefined }> {
+  // Which Codex route is correct is a fact about ~/.codex/auth.json, not about
+  // the caller: a ChatGPT login must reach the `/chatgpt` mux handler, an api-key
+  // login the attributed `/w/codex/v1`. This used to be a defaulted parameter, so
+  // every caller had to remember to pass it. `wrap codex` did (it resolves the
+  // mode for --pixel anyway); `trial` and the interactive picker did not, and
+  // their `false` built an ephemeral CODEX_HOME pinning the api-key route. Codex
+  // then sent the OAuth token to the platform Responses API, which rejects it
+  // with "Missing scopes: api.responses.write", while the model refresh 404s
+  // because `/w/codex/v1/models` is not in the openai adapter's closed
+  // allowlist (#1092). Resolving it here fixes every caller that forgets; an
+  // explicit override still wins, which is what `wrap` passes.
+  const codexSubscription = agent?.id === "codex"
+    ? codexSubscriptionOverride ?? detectCodexWrapAuthMode() === "subscription"
+    : false;
   const { host, port } = gatewayHostPort(gw);
   const local = wrapMode(gw) === "local";
   let proxyStarted = false;
@@ -7140,7 +7161,31 @@ function opencodeNativePluginPath(): string {
   return join(homedir(), ".config", "opencode", "plugins", "caveman-native.js");
 }
 
+function opencodePluginMajor(): number | null {
+  const profile = AGENTS.find((agent) => agent.id === "opencode");
+  const semver = parsedSemver(profile ? detectedAgentVersion(profile) : null);
+  return semver ? semver[0]! : null;
+}
+
 function opencodeNativePluginSource(): string {
+  // OpenCode 2 replaced the plugin API: a V1 hook map no longer loads
+  // (PluginModule.LoadError, missing "default"). Emit the implementation
+  // matching the detected host major. See #1083.
+  //
+  // An unreadable version keeps V1, the status quo. nativeHostProbe returns
+  // version: null for an empty/non-zero/unspawnable `opencode --version`
+  // ("version_probe_failed"), and #1081 records exactly that state on a live
+  // OpenCode 1.18.31 host — so "unknown" is not evidence of "new". Defaulting
+  // it to V2 would break a 1.x user whose probe merely flaked, turning a
+  // working install into one whose plugin the host refuses to load; a 2.x user
+  // in the same state is no worse off than before this gate existed. Only a
+  // version that positively reads as major >= 2 opts into the V2 API.
+  const major = opencodePluginMajor();
+  if (major === null || major < 2) return opencodeNativePluginSourceV1();
+  return opencodeNativePluginSourceV2();
+}
+
+function opencodeNativePluginSourceV1(): string {
   const { cmd, pre } = cavemanInvocation();
   return `// caveman:native-opencode — GENERATED by \`caveman enable opencode\`.
 // Contract: @opencode-ai/plugin 1.17.8 Hooks (installed local type source).
@@ -7309,6 +7354,212 @@ export const CavemanNative = async () => ({
     pending.clear();
   },
 });
+`;
+}
+
+function opencodeNativePluginSourceV2(): string {
+  const { cmd, pre } = cavemanInvocation();
+  return `// caveman:native-opencode — GENERATED by \`caveman enable opencode\`.
+// Contract: OpenCode 2 plugin API — default export { id, setup }
+// (https://opencode.ai/v2/docs/build/plugins/migrate-v1).
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+
+const command = ${JSON.stringify(cmd)};
+const prefix = ${JSON.stringify(pre)};
+
+function call(event, payload = {}) {
+  try {
+    const raw = execFileSync(command, [...prefix, "native-hook", "opencode", event], {
+      input: JSON.stringify({ event_name: event, ...payload }),
+      encoding: "utf8",
+      timeout: 2000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    if (!raw.trim()) return undefined;
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value : undefined;
+  } catch { return undefined; }
+}
+
+function digest(value) {
+  try {
+    const raw = JSON.stringify(value);
+    return { bytes: Buffer.byteLength(raw), sha256: "sha256:" + createHash("sha256").update(raw).digest("hex") };
+  } catch { return undefined; }
+}
+
+function taskType(value) {
+  let text;
+  try { text = JSON.stringify(value).toLowerCase(); } catch { return "general"; }
+  const has = (...terms) => terms.some((term) => text.includes(term));
+  if (has("migration", "migrate", "schema change", "backfill", "rollback")) return "migration";
+  if (has("bug", "fix", "broken", "regression", "crash", "error", "incorrect")) return "bugfix";
+  if (has("investigate", "diagnose", "root cause", "why does", "trace")) return "investigation";
+  if (has("refactor", "restructure", "reorganize", "cleanup")) return "refactor";
+  if (has("review", "audit", "critique", "assess")) return "review";
+  if (has("verify", "verification", "prove", "validate", "check that")) return "verification";
+  if (has("build", "implement", "add", "create", "ship", "feature")) return "feature";
+  return "general";
+}
+
+function taskTerms(value) {
+  let text;
+  try { text = JSON.stringify(value); } catch { return []; }
+  const stop = new Set(["about", "after", "agent", "before", "build", "change", "code", "create", "from", "have", "help", "implement", "into", "make", "please", "project", "repository", "should", "spec", "task", "that", "then", "there", "these", "they", "this", "through", "user", "want", "what", "when", "where", "which", "with", "would", "your"]);
+  const out = [];
+  const seen = new Set();
+  for (const raw of text.match(/[A-Za-z][A-Za-z0-9_./-]{2,63}/g) ?? []) {
+    const term = raw.toLowerCase().replace(/^[-./]+|[-./]+$/g, "");
+    if (!term || term.includes("..") || stop.has(term) || seen.has(term) || /^(?:sk|pk|rk|ghp|github_pat|xox[baprs]|akia)[-_]/i.test(term) || /^[a-z0-9_-]{40,}$/i.test(term)) continue;
+    seen.add(term);
+    out.push(term);
+    if (out.length === 12) break;
+  }
+  return out;
+}
+
+function taskContinuation(value) {
+  const visit = (item) => {
+    if (typeof item === "string") return item;
+    if (Array.isArray(item)) return item.map(visit).filter(Boolean).join(" ");
+    if (!item || typeof item !== "object") return "";
+    return visit(item.text ?? item.content ?? item.message ?? "");
+  };
+  const prompt = visit(value).trim().toLowerCase();
+  if (!prompt || prompt.length > 160 || prompt.split(/\\s+/).length > 14) return false;
+  return /^(?:please\\s+)?(?:continue|go ahead|keep going|proceed|do (?:it|that)|fix (?:it|that)|retry|try again|explain (?:it|that)|what do you mean|yes|yep|yeah|why\\??|how\\??)[.!?\\s]*$/.test(prompt);
+}
+
+export default {
+  id: "caveman-native",
+  async setup(ctx) {
+    // Per-plugin-instance state: one setup() runs per location, so two
+    // projects never share session context through module scope.
+    const contexts = new Map();
+    const pending = new Map();
+
+    function sessionContext(sessionID) {
+      if (!contexts.has(sessionID)) {
+        const out = call("SessionStart", { session_id: sessionID, surface: "cli" });
+        const context = out?.hookSpecificOutput?.additionalContext;
+        contexts.set(sessionID, typeof context === "string" ? context : "");
+      }
+      return contexts.get(sessionID);
+    }
+
+    const controller = new AbortController();
+    const events = (async () => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        handleEvent(event);
+      }
+    })().catch(() => {
+      if (!controller.signal.aborted) console.warn("[caveman-native] Event subscription failed");
+    });
+
+    function sameLocation(event) {
+      return event.location?.directory === ctx.location.directory &&
+        event.location?.workspaceID === ctx.location.workspaceID;
+    }
+
+    function handleEvent(event) {
+      if (!sameLocation(event)) return;
+      const type = event.type;
+      const sessionID = event.data?.sessionID;
+      if (typeof sessionID !== "string" || !sessionID) return;
+      if (type === "session.created") sessionContext(sessionID);
+      if (type === "session.idle") call("Stop", { session_id: sessionID });
+      // "session.compacted" is the V1 event name; V2 reports compaction
+      // through "session.compaction.ended". Handle both.
+      if (type === "session.compaction.ended" || type === "session.compacted") {
+        const out = call("PostCompact", { session_id: sessionID });
+        const context = out?.hookSpecificOutput?.additionalContext;
+        if (typeof context === "string" && context) contexts.set(sessionID, context);
+      }
+      if (type === "session.deleted") {
+        call("SessionEnd", { session_id: sessionID });
+        contexts.delete(sessionID);
+        pending.delete(sessionID);
+      }
+    }
+
+    await ctx.session.hook("prompt", (event) => {
+      const prompt = event.prompt ?? {};
+      const decision = call("UserPromptSubmit", {
+        session_id: event.sessionID,
+        prompt: digest(prompt),
+        task_type: taskType(prompt),
+        task_terms: taskTerms(prompt),
+        task_continuation: taskContinuation(prompt),
+      });
+      const dynamic = decision?.hookSpecificOutput?.additionalContext;
+      if (typeof dynamic === "string" && dynamic) pending.set(event.sessionID, dynamic);
+    });
+
+    await ctx.session.hook("context", (event) => {
+      const stable = sessionContext(event.sessionID);
+      if (stable) event.system.push({ type: "text", text: stable });
+      const hint = pending.get(event.sessionID);
+      if (hint) {
+        event.system.push({ type: "text", text: hint });
+        pending.delete(event.sessionID);
+      }
+    });
+
+    await ctx.session.hook("compaction", (event) => {
+      call("PreCompact", { session_id: event.sessionID });
+      const stable = sessionContext(event.sessionID);
+      if (stable) event.system.push({ type: "text", text: stable });
+    });
+
+    await ctx.tool.hook("execute.before", (event) => {
+      const decision = call("PreToolUse", {
+        session_id: event.sessionID,
+        tool_name: event.tool,
+        tool_input: event.input,
+      });
+      if (typeof decision?.hookSpecificOutput?.additionalContext === "string") {
+        pending.set(event.sessionID, decision.hookSpecificOutput.additionalContext);
+      }
+      // V1 named this tool "bash"; V2 renamed the permission action to
+      // "shell". Accept both so the rewrite survives either host.
+      const input = event.input;
+      if ((event.tool === "bash" || event.tool === "shell") &&
+          input && typeof input === "object" && typeof input.command === "string") {
+        try {
+          const raw = execFileSync(command, [...prefix, "shrink-hook"], {
+            input: JSON.stringify({ tool_name: "Bash", tool_input: { command: input.command } }),
+            encoding: "utf8",
+            timeout: 750,
+          });
+          const rewritten = JSON.parse(raw)?.hookSpecificOutput?.updatedInput?.command;
+          if (typeof rewritten === "string" && rewritten) input.command = rewritten;
+        } catch {}
+      }
+    });
+
+    await ctx.tool.hook("execute.after", (event) => {
+      if (event.status !== "completed") return;
+      const decision = call("PostToolUse", {
+        session_id: event.sessionID,
+        tool_name: event.tool,
+        tool_input: event.input,
+        tool_output: event.result,
+      });
+      const replacement = decision?.hookSpecificOutput?.updatedToolOutput ?? decision?.output_replacement;
+      if (typeof replacement === "string") {
+        event.result = { ...event.result, content: replacement };
+      }
+    });
+
+    return () => {
+      controller.abort();
+      for (const sessionID of contexts.keys()) call("SessionEnd", { session_id: sessionID });
+      contexts.clear();
+      pending.clear();
+    };
+  },
+};
 `;
 }
 
@@ -7993,6 +8244,67 @@ function readPendingNativeJournal(agent: string): NativeJournal | undefined {
   return readNativeJournalAt(nativePendingJournalPath(agent), agent);
 }
 
+// nativeRoutePinnedFor reports the config file that pins this agent's base URL,
+// when native routing is installed for it, or null when nothing is pinned.
+//
+// It reads the install journal rather than re-deriving per-agent config shapes,
+// so it covers every native host by construction: claude's settings.json env
+// block, codex's config.toml model_provider, hermes/gemini/aider's marker
+// fences, opencode's routes map, pi's bundle. A caller that needs to point an
+// agent somewhere else for one run has to know that any of these outranks the
+// environment it is about to set.
+//
+// Deliberately journal-only and file-cheap: unlike nativeIntegrationStatus this
+// probes no binary, proxy or MCP server, because the question is only "is a
+// route pinned on disk", not "is the whole integration healthy".
+//
+// The PENDING journal has to be consulted too, and the two are read differently.
+// installNativeAgent writes the pending journal first, then each host file, and
+// publishes the committed journal LAST. So a process death between those leaves
+// a fully applied, fully readable pinned route on disk with only the pending
+// journal to show for it — which is exactly the state this guard exists to
+// catch, reached by a crash instead of a successful install.
+//
+// A committed journal is taken at its word: enable finished, the route is
+// pinned. A pending one is genuinely ambiguous — the mutation may or may not
+// have landed before the process died — so it is resolved against the file
+// itself using the after_sha256 the journal already records. That is
+// agent-agnostic (no per-host config shapes here) and avoids refusing a trial
+// over a stale pending journal whose writes never happened.
+function nativeRoutePinnedFor(agent: string): { file: string; route: string; pending: boolean } | null {
+  const routeIn = (owned: Record<string, unknown> | undefined): string | null => {
+    if (!owned) return null;
+    if (typeof owned.route === "string" && owned.route) return owned.route;
+    // opencode pins one route per protocol instead of a single base URL.
+    const routes = owned.routes;
+    if (routes && typeof routes === "object" && !Array.isArray(routes)) {
+      for (const value of Object.values(routes as Record<string, unknown>)) {
+        if (typeof value === "string" && value) return value;
+      }
+    }
+    return null;
+  };
+
+  const committed = readNativeJournal(agent);
+  for (const operation of committed?.operations ?? []) {
+    const route = routeIn(operation.owned);
+    if (route) return { file: operation.file, route, pending: false };
+  }
+
+  const pending = readPendingNativeJournal(agent);
+  for (const operation of pending?.operations ?? []) {
+    const route = routeIn(operation.owned);
+    if (!route) continue;
+    const current = fileBytes(operation.file);
+    // No file, or contents that are not what this operation would have written,
+    // means the interrupted install never got as far as pinning this route.
+    if (current && bytesHash(current) === operation.after_sha256) {
+      return { file: operation.file, route, pending: true };
+    }
+  }
+  return null;
+}
+
 function recoverPendingNativeInstallUnlocked(agent: NativeAgent): boolean {
   const pending = readPendingNativeJournal(agent);
   if (!pending) return false;
@@ -8570,13 +8882,35 @@ function nativeIntegrationStatus(agent: NativeAgent) {
       return false;
     }
   })();
+  // Same class as piBundleCurrent above, one step removed: opencode's plugin API
+  // is chosen when the mutations are built, so an install made against OpenCode
+  // 1.x keeps its V1 hook map after the host upgrades to 2.x — which that host
+  // refuses to load (#1083). Nothing else drifts on that upgrade: same journal,
+  // same bytes, so packCurrent and ownedHealthy both still pass and doctor called
+  // an unloadable plugin "installed". `caveman opencode` deliberately skips
+  // enableNative whenever a journal exists (status probes spawn subprocesses),
+  // which is exactly why that skip's own comment names doctor as the repair door
+  // for drifted installs — so the drift has to be visible here to be repairable.
+  // An unreadable version yields no judgement, matching opencodeNativePluginSource:
+  // "unknown" is not evidence of a new host, so it must not degrade a good install.
+  const opencodePluginApiCurrent = agent !== "opencode" || (() => {
+    const operation = journal?.operations.find((item) => item.kind === "opencode-plugin");
+    const current = operation ? fileBytes(operation.file)?.toString("utf8") : null;
+    if (!current) return true;
+    const installedV2 = current.includes("async setup(ctx)");
+    const installedV1 = current.includes("export const CavemanNative");
+    if (installedV1 === installedV2) return true;
+    const semver = parsedSemver(host.version);
+    if (!semver) return true;
+    return (semver[0]! >= 2) === installedV2;
+  })();
   const routeHealthy = ownedHealthy && (agent === "opencode"
     ? (routeOperation?.owned?.routes as Record<string, unknown> | undefined)?.openai === appendUrlPath(expectedRoute, "/openai/v1")
       && (routeOperation?.owned?.routes as Record<string, unknown> | undefined)?.anthropic === appendUrlPath(expectedRoute, "/anthropic/v1")
     : agent === "pi" ? piBundleCurrent : routeOperation?.owned?.route === expectedRoute);
   const proxyHealthy = wrapMode(gatewayURL()) === "managed" || Boolean(probeProxyVersion()?.capabilities.includes("native_runtime_v1"));
   const recoveryHealthy = agent === "aider" || Boolean(mcp?.probe.current);
-  const state = !available ? "unavailable" : transactionPending ? "degraded" : !installed ? "available" : !packCurrent || !ownedHealthy || !routeHealthy || !proxyHealthy || !recoveryHealthy ? "degraded" : "installed";
+  const state = !available ? "unavailable" : transactionPending ? "degraded" : !installed ? "available" : !packCurrent || !ownedHealthy || !routeHealthy || !proxyHealthy || !recoveryHealthy || !opencodePluginApiCurrent ? "degraded" : "installed";
 	const coreSupported = agent === "aider" ? ownedHealthy : ownedHealthy && Boolean(NATIVE_PACK.core);
 	const coreActive = agent === "aider"
 	  ? ownedHealthy
@@ -8584,7 +8918,8 @@ function nativeIntegrationStatus(agent: NativeAgent) {
   const fileText = checks.map((check) => fileBytes(check.file)?.toString("utf8") ?? "").join("\n");
   const components: NativeComponents = {
     routing: routeHealthy && proxyHealthy && (agent === "claude" ? fileText.includes("ANTHROPIC_BASE_URL") : agent === "codex" ? fileText.includes("model_providers.caveman") : agent === "hermes" ? fileText.includes(HERMES_NATIVE_ROUTE_BEGIN) : agent === "gemini" ? fileText.includes(GEMINI_NATIVE_ENV_BEGIN) : agent === "opencode" ? fileText.includes("caveman:native-opencode") : agent === "pi" ? fileText.includes("caveman:native-pi") : fileText.includes(AIDER_NATIVE_ROUTE_BEGIN)),
-    lifecycle_hooks: agent !== "aider" && ownedHealthy,
+    // A plugin the host cannot load runs no hooks, whatever its bytes hash to.
+    lifecycle_hooks: agent !== "aider" && ownedHealthy && opencodePluginApiCurrent,
     core: coreActive,
     mcp_recovery: agent !== "aider" && ownedHealthy && Boolean(mcp?.probe.current),
     // Codex is false for the same reason hermes is: no command rewrite happens. The
@@ -9152,6 +9487,67 @@ function wrapBaseUrlEnv(gw: string): NodeJS.ProcessEnv {
   return env;
 }
 
+// wrapWorkTags names the repository and branch a wrapped session is launched
+// in, as the managed gateway's x-cave-tags value ("repo=owner/name,branch=…").
+// Delivery joins coding-agent spend to merged changes on exactly these two
+// keys, and nothing else in the request carries them. Read once at spawn with
+// hardened git (git-safe.ts); a launch outside a repository, without an origin,
+// or on a detached HEAD yields the tags it can and never fails the wrap.
+// The value is fixed for the process: a branch switch mid-session is picked up
+// by the next launch, not this one.
+//
+// Only github.com remotes are tagged: Cloud joins tags['repo'] to the GitHub
+// pull requests it imported, keyed owner/name, so a same-named fork on another
+// host would collide with the wrong repository. Values are printable ASCII
+// without comma or equals — a header value must be a ByteString, and the tag
+// list is comma/equals delimited — anything else drops the tag, never the wrap.
+export function wrapWorkTags(cwd = process.cwd()): string {
+  const read = (...args: string[]): string => {
+    try {
+      return execFileSync("git", hardenedGitArgs(cwd, ...args), {
+        encoding: "utf8", env: hardenedGitEnv(), stdio: ["ignore", "pipe", "ignore"], timeout: 2000,
+      }).trim();
+    } catch {
+      return "";
+    }
+  };
+  const parts: string[] = [];
+  const repo = repoSlugFromRemote(read("remote", "get-url", "origin"));
+  if (repo) parts.push(`repo=${repo}`);
+  const branch = read("branch", "--show-current");
+  if (branch && branch.length <= 255 && workTagValueSafe(branch)) parts.push(`branch=${branch}`);
+  return parts.join(",");
+}
+
+// workTagValueSafe: printable ASCII (0x21–0x7E) with no comma or equals.
+export function workTagValueSafe(value: string): boolean {
+  return /^[\x21-\x2B\x2D-\x3C\x3E-\x7E]+$/.test(value);
+}
+
+// repoSlugFromRemote reduces a github.com remote URL to owner/name — the form
+// Cloud's Delivery join and its imported pull requests use — or "" when the
+// remote is on any other host or has no such shape. Never the URL itself: a
+// remote can embed a credential.
+export function repoSlugFromRemote(remote: string): string {
+  const cleaned = remote.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
+  let host = "";
+  let path = "";
+  const url = /^[a-z][a-z0-9+.-]*:\/\/([^/]+)\/(.*)$/i.exec(cleaned);
+  const scp = /^(?:[^@/:]+@)?([^/:]+):(.*)$/.exec(cleaned);
+  if (url) {
+    host = url[1]!.replace(/^[^@]*@/, "").replace(/:\d+$/, "");
+    path = url[2]!;
+  } else if (scp) {
+    host = scp[1]!;
+    path = scp[2]!;
+  } else {
+    return "";
+  }
+  if (host.toLowerCase() !== "github.com") return "";
+  const match = /^([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)$/.exec(path);
+  return match ? `${match[1]}/${match[2]}` : "";
+}
+
 function attributedGatewayUrl(gw: string, agent: AgentProfile): string {
   return appendUrlPath(gw, `/w/${agent.id}`);
 }
@@ -9171,6 +9567,29 @@ function mergeAnthropicCustomHeader(raw: string | undefined, name: string, value
     });
   if (value !== undefined) kept.push(`${name}: ${value}`);
   return kept.join("\n");
+}
+
+// existingCustomHeader returns the value of one header inside the newline-
+// separated ANTHROPIC_CUSTOM_HEADERS block, or "" when absent.
+function existingCustomHeader(raw: string | undefined, name: string): string {
+  const target = name.toLowerCase();
+  for (const line of (raw ?? "").split(/\r\n|\n|\r/)) {
+    const colon = line.indexOf(":");
+    if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === target) return line.slice(colon + 1).trim();
+  }
+  return "";
+}
+
+// mergeWorkTags adds the repo/branch entries of `computed` that `existing`
+// (a caller's own "k=v,k=v" tag list) does not already name.
+export function mergeWorkTags(existing: string, computed: string): string {
+  const entries = existing.split(",").map((part) => part.trim()).filter(Boolean);
+  const keys = new Set(entries.map((part) => part.slice(0, part.indexOf("=") < 0 ? part.length : part.indexOf("="))));
+  for (const part of computed.split(",").filter(Boolean)) {
+    const key = part.slice(0, part.indexOf("="));
+    if (!keys.has(key)) entries.push(part);
+  }
+  return entries.join(",");
 }
 
 function bedrockCredentialEnvValue(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -9353,6 +9772,13 @@ export function buildWrapEnv(agent?: AgentProfile, gw = gatewayURL(), mcpMode: M
     env.QWEN_CODE_LEGACY_MCP_BLOCKING = "1";
   }
   if (agent.id === "hermes") applyHermesAuthEnv(env, renderedGw, gw);
+  if (agent.id === "claude" && wrapMode(gw) === "managed") {
+    // Repository and branch ride every request as x-cave-tags so the managed
+    // gateway can join this session's spend to the change it ships. A user's
+    // own x-cave-tags keeps its keys; only repo/branch it did not set are added.
+    const tags = mergeWorkTags(existingCustomHeader(env.ANTHROPIC_CUSTOM_HEADERS, "x-cave-tags"), wrapWorkTags());
+    if (tags) env.ANTHROPIC_CUSTOM_HEADERS = mergeAnthropicCustomHeader(env.ANTHROPIC_CUSTOM_HEADERS, "x-cave-tags", tags);
+  }
   if (agent.id === "claude" && wrapMode(gw) === "local" && env[CLAUDE_ASSUME_FIRST_PARTY_ENV] === undefined && proxyAnthropicUpstreamIsFirstParty()) {
     // Keep Claude Code's first-party capability set (1M context window /
     // ~600k auto-compact window) intact behind the local pass-through proxy
@@ -9491,27 +9917,58 @@ export function shouldOpenLoginBrowser(noBrowser: boolean, interactive = Boolean
   return interactive && !noBrowser;
 }
 
-function validateLoginArgs(argv: string[]): { noBrowser: boolean } {
+function validateLoginArgs(argv: string[]): { noBrowser: boolean; instance?: string } {
   let noBrowser = false;
+  const values = new Map<string, string>();
+  const usage = "login [--no-browser] [--instance <https-origin> | --base-url <url> [--gateway-url <url>]]";
   for (let index = 0; index < argv.length; index++) {
     const arg = argv[index]!;
     if (arg === "--no-browser") {
-      if (noBrowser) commandUsage("login [--no-browser] [--base-url <url>] [--gateway-url <url>]");
+      if (noBrowser) commandUsage(usage);
       noBrowser = true;
       continue;
     }
-    if (arg === "--base-url" || arg === "--gateway-url") {
-      const value = argv[++index];
-      if (!value || value.startsWith("-")) commandUsage("login [--no-browser] [--base-url <url>] [--gateway-url <url>]");
+    const flag = arg.split("=", 1)[0]!;
+    if (["--instance", "--base-url", "--gateway-url"].includes(flag)) {
+      const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : argv[++index];
+      if (!value || value.startsWith("-") || values.has(flag)) commandUsage(usage);
+      values.set(flag, value);
       continue;
     }
-    if (arg.startsWith("--base-url=") || arg.startsWith("--gateway-url=")) {
-      if (!arg.slice(arg.indexOf("=") + 1)) commandUsage("login [--no-browser] [--base-url <url>] [--gateway-url <url>]");
-      continue;
-    }
-    commandUsage("login [--no-browser] [--base-url <url>] [--gateway-url <url>]");
+    commandUsage(usage);
   }
-  return { noBrowser };
+  const instance = values.get("--instance");
+  if (instance === undefined) return { noBrowser };
+  if (values.has("--base-url") || values.has("--gateway-url")) commandUsage(usage);
+  const url = new URL(instance);
+  if (!secureLoginURL(url) || url.pathname !== "/" || url.search || url.hash || url.hostname.replace(/\.$/, "") === new URL(PROD_API_URL).hostname) {
+    throw new Error("--instance requires a private HTTPS origin (HTTP loopback is allowed for local development)");
+  }
+  return { noBrowser, instance: url.origin };
+}
+
+function secureLoginURL(url: URL, allowLoopback = true): boolean {
+  return !url.username && !url.password && (url.protocol === "https:" ||
+    (allowLoopback && url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)));
+}
+
+function privateVerificationURL(code: Record<string, unknown>, instance: string): string {
+  if (typeof code.device_code !== "string" || !code.device_code || code.device_code.length > 4096 ||
+      typeof code.user_code !== "string" || !/^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/.test(code.user_code) ||
+      typeof code.expires_in !== "number" || !Number.isFinite(code.expires_in) || code.expires_in <= 0 || code.expires_in > 3600 ||
+      (code.interval !== undefined && (typeof code.interval !== "number" || !Number.isFinite(code.interval) || code.interval < 0 || code.interval > 60))) {
+    throw new Error("private device authorization returned an invalid code response");
+  }
+  const value = code.verification_uri_complete ?? code.verification_uri;
+  if (typeof value !== "string") throw new Error("private device authorization omitted its browser URL");
+  const url = new URL(value);
+  if (!secureLoginURL(url, new URL(instance).protocol === "http:") || url.hash) {
+    throw new Error("private device authorization returned an unsafe browser URL");
+  }
+  url.searchParams.set("user_code", code.user_code);
+  url.searchParams.set("connection", "mcp");
+  url.searchParams.set("client_name", "Caveman CLI");
+  return url.href;
 }
 
 function openLoginBrowser(url: string): void {
@@ -9536,6 +9993,7 @@ async function acknowledgeDeviceGrant(baseURL: string, accessToken: string, devi
     try {
       const response = await fetch(`${baseURL}/api/v1/auth/device/ack`, {
         method: "POST",
+        redirect: "manual",
         headers: {
           authorization: `Bearer ${accessToken}`,
           "content-type": "application/json",
@@ -9561,28 +10019,28 @@ async function acknowledgeDeviceGrant(baseURL: string, accessToken: string, devi
 
 // 0600 credentials file) — never in plaintext config. organization_id is bound
 // from the returned token, never from any local input.
-// Keep device-flow implementation dormant for later beta reopening. This gate
-// runs before argument parsing, network requests, browser launch, or local writes.
+// Hosted login remains gated; explicit private instances use project access.
 function blockCloudLoginWhileBeta(): void {
   throw new Error("Caveman Cloud platform is still in beta.");
 }
 
 async function login(argv: string[] = []) {
-  blockCloudLoginWhileBeta();
-  const { noBrowser } = validateLoginArgs(argv);
-  const baseURL = resolveLoginBaseUrl(argv);
+  if (!argv.some((arg) => arg === "--instance" || arg.startsWith("--instance="))) blockCloudLoginWhileBeta();
+  const { noBrowser, instance } = validateLoginArgs(argv);
+  const baseURL = instance ?? resolveLoginBaseUrl(argv);
 
   const codeResp = await fetch(`${baseURL}/api/v1/auth/device/code`, {
     method: "POST",
+    redirect: "error",
     headers: { "content-type": "application/json" },
     body: "{}",
     signal: AbortSignal.timeout(5000),
   });
   if (!codeResp.ok) throw new Error(`device authorization failed: HTTP ${codeResp.status}`);
   const code = await codeResp.json();
-  if (!code.device_code) throw new Error(`device authorization failed: ${JSON.stringify(code)}`);
+  if (!code.device_code) throw new Error("device authorization failed: missing device code");
 
-  const verificationURL = code.verification_uri_complete ?? code.verification_uri;
+  const verificationURL = instance ? privateVerificationURL(code, instance) : code.verification_uri_complete ?? code.verification_uri;
   console.error(`\n  Authorize this device in your browser:`);
   console.error(`    ${verificationURL}`);
   console.error(`    code: ${code.user_code}\n`);
@@ -9597,6 +10055,7 @@ async function login(argv: string[] = []) {
     try {
       const tokResp = await fetch(`${baseURL}/api/v1/auth/device/token`, {
         method: "POST",
+        redirect: "manual",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ device_code: code.device_code }),
         signal: AbortSignal.timeout(5000),
@@ -9607,7 +10066,7 @@ async function login(argv: string[] = []) {
         const seconds = Number(retryAfter);
         if (Number.isFinite(seconds) && seconds >= 0) retryAfterMs = seconds * 1000;
       }
-      tok = await tokResp.json() as Record<string, unknown>;
+      tok = tokenStatus >= 300 && tokenStatus < 400 ? {} : await tokResp.json() as Record<string, unknown>;
     } catch (error) {
       // RFC 8628 polling is retryable: a dropped connection or malformed
       // transient response must not consume the approved code or abort login
@@ -9619,6 +10078,7 @@ async function login(argv: string[] = []) {
       await sleep(Math.max(intervalMs, retryAfterMs, 200));
       continue;
     }
+    if (tokenStatus >= 300 && tokenStatus < 400) throw new Error("device login refused a redirected token endpoint");
     if (tokenStatus === 429) {
       // rateLimitAuth returns a nested cave error envelope rather than the RFC
       // `error` string. Status is the authoritative retry signal here.
@@ -9627,6 +10087,13 @@ async function login(argv: string[] = []) {
     }
     const accessToken = typeof tok.access_token === "string" ? tok.access_token : "";
     if (accessToken) {
+	  if (instance && (tokenStatus < 200 || tokenStatus >= 300 || tok.credential_kind !== "none" ||
+	      ["gateway_api_key", "gateway_key_id", "gateway_url"].some((key) => tok[key] != null) ||
+	      typeof tok.refresh_token !== "string" || !tok.refresh_token || typeof tok.project_id !== "string" || !tok.project_id ||
+	      typeof tok.delivery_ack_token !== "string" || !tok.delivery_ack_token || typeof tok.scope !== "string" || !tok.scope ||
+	      tok.scope.split(/\s+/).some((scope) => scope === "proxy:write" || scope === "sdk:write"))) {
+	    throw new Error("private device login requires a keyless project grant with a refresh token and delivery acknowledgement");
+	  }
 	  const credentials: StoredCredentials = {
 	    access_token: accessToken,
 	    ...(typeof tok.refresh_token === "string" && tok.refresh_token ? { refresh_token: tok.refresh_token } : {}),
@@ -9636,7 +10103,7 @@ async function login(argv: string[] = []) {
 	  };
 	  const tokenStore = storeCredentials(credentials);
 	  const organizationId = orgFromToken(accessToken);
-	  const gateway = resolveLoginGatewayUrl(baseURL, tok, code, argv);
+	  const gateway = instance ? "" : resolveLoginGatewayUrl(baseURL, tok, code, argv);
 	  const saved: Config = { baseURL, token: "", tokenStore };
 	  if (organizationId) saved.organizationId = organizationId;
 	  if (credentials.project_id) saved.projectId = credentials.project_id;
@@ -9654,6 +10121,10 @@ async function login(argv: string[] = []) {
 	    // until the control plane has recorded that this CLI stored the bundle.
 	    await acknowledgeDeviceGrant(baseURL, credentials.access_token, code.device_code, ackToken);
 	  }
+      if (instance) {
+        print({ authenticated: true, baseURL, organization_id: organizationId ?? null, project_id: credentials.project_id, scope: tok.scope, credential_kind: "none", token_store: tokenStore });
+        return;
+      }
       // Mint/refresh the local-wrap entitlement for this device. Best
       // effort: login never fails for seats or a down entitlement service.
       await fetchAndStoreWrapEntitlement(baseURL, credentials.access_token);
@@ -9708,6 +10179,7 @@ async function logout() {
 	  };
 	  const request: RequestInit = {
 	    method: "POST",
+	    redirect: "manual",
 	    headers,
 	    signal: AbortSignal.timeout(5000),
 	  };
@@ -15494,6 +15966,40 @@ async function trial(rest: string[]) {
   const proxyResolved = which(proxyBin());
   if (!proxyResolved) return startMissingProxyUI(proxyBin());
 
+  // A trial measures traffic by standing up its OWN proxy on a free port under
+  // a `trial:<id>` label and pointing the child at it through the environment.
+  // Native routing pins the base URL inside the agent's own config file, and an
+  // agent reads its config in preference to its environment — so the child goes
+  // to the persistent listener instead, which carries no trial label.
+  // RecordPayload only stores payloads for a `trial:` label, so trial_payloads
+  // stays empty, the replay optimizer has nothing to replay, and every number
+  // in the report renders 0. Nothing errors; the trial exits 0 and reports a
+  // measurement of nothing. Refuse up front instead of producing that report,
+  // and refuse BEFORE `trial start` so no orphan trial row is opened. (#1068)
+  const pinned = nativeRoutePinnedFor(agent?.id ?? requested);
+  if (pinned) {
+    console.error(pinned.pending
+      ? `caveman trial cannot measure ${agent?.id ?? requested}: an interrupted native install left its routing in place.`
+      : `caveman trial cannot measure ${agent?.id ?? requested} while native routing is enabled.`);
+    console.error("");
+    console.error(`  ${pinned.file}`);
+    console.error(`  pins the base URL to ${pinned.route}`);
+    console.error("");
+    console.error("A trial runs its own proxy on its own port and points the agent at it through");
+    console.error("the environment. That config file wins, so the agent would keep talking to the");
+    console.error("persistent listener, the trial would capture nothing, and the report would say");
+    console.error("zero requests and $0.0000 — which reads as a measurement rather than as silence.");
+    console.error("");
+    // invokedAs(), not invokedCommand(): invokedCommand renders the verb of the
+    // CURRENT invocation, which is always "trial" here, so it would print
+    // "caveman trial <agent>" for the disable and enable lines.
+    console.error(`Turn native routing off for the duration of the trial, then put it back:`);
+    console.error(`  ${invokedAs()} disable ${agent?.id ?? requested}`);
+    console.error(`  ${invokedAs()} trial -- ${command.join(" ")}`);
+    console.error(`  ${invokedAs()} enable ${agent?.id ?? requested}`);
+    process.exit(2);
+  }
+
   const port = await freePort();
   const listen = `127.0.0.1:${port}`;
   const trialURL = `http://${listen}`;
@@ -18475,6 +18981,7 @@ async function refreshCLIConfig(cfg: Config): Promise<Config> {
 	try {
 	  const response = await fetch(`${cfg.baseURL}/api/v1/auth/refresh`, {
 	    method: "POST",
+	    redirect: "manual",
 	    headers: { "content-type": "application/json", "x-cave-client": "cli" },
 	    body: JSON.stringify({ refresh_token: cfg.refreshToken }),
 	    signal: AbortSignal.timeout(5000),

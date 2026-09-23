@@ -151,6 +151,55 @@ test('never eats a hyphen-joined component of a compound word', () => {
   assert.doesNotMatch(compressed, /\bmaybe\b/i);
 });
 
+test('never eats "sure" out of the "make sure" / "be sure" / "not sure" collocations', () => {
+  // `sure` is a pleasantry as a bare interjection ("Sure, this returns the
+  // value"), but in these fixed collocations it is the complement of the verb,
+  // so dropping it does not weaken the sentence — it changes what the sentence
+  // says. "Make sure the file exists" is a check; "Make file exists" reads as a
+  // create. Same class as the hyphenated-compound corruption above: a word that
+  // is filler on its own is not filler inside a collocation. The proxy rewrites
+  // MCP tool descriptions in place via compressDescriptionsInPlace, so the
+  // mangled contract is what the model reads as the tool's behavior (#1073).
+  const cases = [
+    'Make sure the file exists.',
+    'Make sure to call init before any other tool.',
+    'Be sure to pass an absolute path.',
+    'Not sure why this fails.',
+    'Please make sure.',
+    "I'm sure that works.",
+    'Ensure you make sure of the ordering.',
+    // CRLF: the interjection rule anchors on line starts, so a Windows-newline
+    // description must not take a different branch from the LF one.
+    'Step one.\r\nMake sure the file exists.',
+    'MAKE SURE THE PATH IS ABSOLUTE.',
+    'Surely, this works.',
+  ];
+  for (const input of cases) {
+    const { compressed } = compress(input);
+    assert.match(
+      compressed,
+      /sure/i,
+      `dropped the verb complement "sure": "${input}" → "${compressed}"`
+    );
+  }
+  // The bare interjection is still dropped — the fix must not turn the rule
+  // off, only stop it from reaching inside a collocation.
+  for (const input of [
+    'Sure, this returns the value',
+    'Sure! That is the default.',
+    'Done. Sure, that works too.',
+    'Done.\r\nSure, that works.',
+    'Done.\nSure, that works.',
+  ]) {
+    const { compressed } = compress(input);
+    assert.doesNotMatch(
+      compressed,
+      /sure/i,
+      `kept a bare "sure" interjection: "${input}" → "${compressed}"`
+    );
+  }
+});
+
 test('compresses real MCP-style description', () => {
   const input = 'Get the current weather for a given location. ' +
     'Returns the temperature in Fahrenheit. ' +
@@ -390,6 +439,76 @@ test('close reports the upstream exit code, or 128+signal when it was killed', (
   assert.equal(mk().onClose(null, 'SIGTERM'), 143);
   assert.equal(mk().onClose(null, 'SIGINT'), 130);
   assert.equal(mk({ spawnFailed: () => true }).onClose(0, null), 1, 'spawn failure must not report success');
+});
+
+// The EOF half of the same sequence. A host shuts an MCP stdio server down by
+// closing its stdin first; these cover what happens when the upstream does and
+// does not act on that.
+test('passes client EOF on to the upstream', () => {
+  const child = fakeChild();
+  let ended = 0;
+  const shutdown = createShutdown({ child, timers: fakeTimers(), endUpstreamInput: () => { ended++; } });
+  shutdown.closeInput();
+  assert.equal(ended, 1);
+  assert.deepEqual(child.signals, [], 'EOF must not signal the upstream on its own');
+});
+
+test('does not signal an upstream that exits on EOF', () => {
+  // The normal path: a well-behaved server sees EOF and leaves. Nothing may be
+  // signalled, or every clean shutdown would look like a kill.
+  const child = fakeChild();
+  const timers = fakeTimers();
+  const shutdown = createShutdown({ child, timers });
+  shutdown.closeInput();
+  child.exitCode = 0;
+  timers.fire();
+  assert.deepEqual(child.signals, []);
+});
+
+test('escalates EOF through SIGTERM to SIGKILL when the upstream ignores both', () => {
+  // Without this the wrapper waits on an upstream that is never going to
+  // leave, and the host waits on the wrapper.
+  const child = fakeChild();
+  const timers = fakeTimers();
+  const shutdown = createShutdown({ child, timers });
+  shutdown.closeInput();
+  assert.equal(shutdown.pendingEscalation, true, 'EOF armed no wait');
+  timers.fire();
+  assert.deepEqual(child.signals, ['SIGTERM'], 'EOF grace expiring did not send SIGTERM');
+  timers.fire();
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('EOF on an already-exited upstream arms nothing', () => {
+  const child = fakeChild({ exitCode: 0 });
+  const timers = fakeTimers();
+  let ended = 0;
+  const shutdown = createShutdown({ child, timers, endUpstreamInput: () => { ended++; } });
+  shutdown.closeInput();
+  assert.equal(ended, 1, 'the upstream stdin still gets closed');
+  assert.equal(timers.armed, 0, 'armed a wait for a child that is already gone');
+});
+
+test('a repeated EOF does not arm a second wait', () => {
+  const child = fakeChild();
+  const timers = fakeTimers();
+  const shutdown = createShutdown({ child, timers });
+  shutdown.closeInput();
+  shutdown.closeInput();
+  assert.equal(timers.armed, 1);
+});
+
+test('close clears a pending EOF wait', () => {
+  // Same stale-timer hazard as the signal path: the upstream is gone, so the
+  // wait must not come back and signal whatever holds that pid next.
+  const child = fakeChild();
+  const timers = fakeTimers();
+  const shutdown = createShutdown({ child, timers });
+  shutdown.closeInput();
+  shutdown.onClose(0, null);
+  assert.equal(shutdown.pendingEscalation, false);
+  timers.fire();
+  assert.deepEqual(child.signals, [], 'stale EOF wait fired after close');
 });
 
 test('the default grace period is a real duration', () => {
